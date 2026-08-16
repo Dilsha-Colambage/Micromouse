@@ -10,7 +10,8 @@
 #define BIN1 15
 #define BIN2 14
 #define PWMB 32
-#define STBY 21
+// STBY is tied directly to 3.3V on the board (not driven by the ESP32).
+// Pin 21 is used for I2C SDA (see below).
 
 // --- Encoders (input-only pins; may need external pull-ups) ---
 #define L_ENC_A 35
@@ -19,11 +20,11 @@
 #define R_ENC_B 39
 
 // --- Time of Flight (I2C shared bus + XSHUT) ---
-#define I2C_SDA 23
-#define I2C_SCL 19
-#define XSHUT_F 5
-#define XSHUT_L 4
-#define XSHUT_R 2
+#define I2C_SDA 21
+#define I2C_SCL 22
+#define XSHUT_F 4
+#define XSHUT_L 5
+#define XSHUT_R 18
 
 // --- Onboard BOOT button (reused as a start switch after boot) ---
 #define BTN_BOOT 0   // GPIO0, active-low (pressed = LOW), has internal pull-up
@@ -45,6 +46,11 @@ const int RAMP_TICKS = 300;
 
 // Sensing: distance below this (mm) counts as a wall. Tune against the 180mm cell.
 const int WALL_THRESHOLD_MM = 110;
+
+// Front-wall ranging: if a wall ahead gets this close (mm) while driving, stop early
+// instead of finishing the fixed tick count. Prevents nosing into the front wall and
+// re-references position each time we face a wall. Tune to your desired standoff.
+const int FRONT_STOP_MM = 70;
 
 // Maze Logic
 #define MAZE_SIZE 6
@@ -68,12 +74,11 @@ VL53L0X sensorFront, sensorLeft, sensorRight;
 bool okFront = false, okLeft = false, okRight = false; // init status; fail-safe = treat as wall
 
 // ======================== BOOT BUTTON ========================
-// Returns true once per press (debounced), so it acts like a momentary start switch.
+// Returns true on a debounced press. Uses the pattern verified working on this board.
 bool bootPressed() {
-  if (digitalRead(BTN_BOOT) == LOW) {   // pressed
-    delay(30);                          // debounce
-    if (digitalRead(BTN_BOOT) == LOW) {
-      while (digitalRead(BTN_BOOT) == LOW) delay(5); // wait for release
+  if (digitalRead(BTN_BOOT) == LOW) {   // LOW means pressed
+    delay(50);                          // software debounce filter
+    if (digitalRead(BTN_BOOT) == LOW) { // double check it is still held down
       return true;
     }
   }
@@ -98,19 +103,41 @@ void setMotorRight(int pwm) {
 void stopMotors() { setMotorLeft(0); setMotorRight(0); }
 
 // ======================== REAL SENSORS (replaces virtual UDP) ========================
-// Reads one sensor; returns true if a wall is present (or on failure/timeout, fail-safe).
-bool wallFromSensor(VL53L0X &s, bool ok) {
-  if (!ok) return true; // sensor never initialised -> assume wall
+// Last filtered distances in mm. 9999 = out of range / open corridor / glitch read.
+int dLeft = 9999, dFront = 9999, dRight = 9999;
+
+// Sentinel returned for an open corridor or an unusable reading.
+const int TOF_OPEN = 9999;
+
+// Reads one sensor, filtering out the VL53L0X's junk values (0, 65535, timeouts).
+int readDistance(VL53L0X &s, bool ok) {
+  if (!ok) return -1; // sensor never initialised -> caller treats as a wall
   uint16_t d = s.readRangeContinuousMillimeters();
-  if (s.timeoutOccurred()) return true; // no reading -> assume wall
-  return (d < WALL_THRESHOLD_MM);
+  if (s.timeoutOccurred() || d == 0 || d == 65535) return TOF_OPEN; // glitch -> open
+  return (int)d;
+}
+
+// A wall is present if the sensor is dead (-1) or the reading is under threshold.
+bool distIsWall(int d) { return (d < 0) || (d < WALL_THRESHOLD_MM); }
+
+// Refresh the distances only (used for live telemetry while driving).
+void readToF() {
+  dLeft  = readDistance(sensorLeft,  okLeft);
+  dFront = readDistance(sensorFront, okFront);
+  dRight = readDistance(sensorRight, okRight);
+}
+
+void printToF(const char *tag) {
+  Serial.printf("%s ToF[mm] L:%4d F:%4d R:%4d  (thr=%d)\n", tag, dLeft, dFront, dRight, WALL_THRESHOLD_MM);
 }
 
 void updateVirtualSensors() {
-  v_left  = wallFromSensor(sensorLeft,  okLeft);
-  v_front = wallFromSensor(sensorFront, okFront);
-  v_right = wallFromSensor(sensorRight, okRight);
-  Serial.printf("Scanned (%d,%d) -> L:%d F:%d R:%d\n", robotX, robotY, v_left, v_front, v_right);
+  readToF();
+  v_left  = distIsWall(dLeft);
+  v_front = distIsWall(dFront);
+  v_right = distIsWall(dRight);
+  Serial.printf("Scanned (%d,%d) -> L:%d F:%d R:%d | mm L:%d F:%d R:%d\n",
+                robotX, robotY, v_left, v_front, v_right, dLeft, dFront, dRight);
 }
 
 // ======================== NAVIGATION & FLOODFILL ========================
@@ -227,6 +254,8 @@ void moveCells(int numCells) {
 
   long targetTicks = ((long)CELL_SIZE_MM * numCells * ENCODER_CPR) / WHEEL_CIRC_MM;
   long currentTicks = 0;
+  unsigned long lastTele = 0;
+  unsigned long lastFront = 0;
 
   while (currentTicks < targetTicks) {
     int16_t lT, rT;
@@ -234,6 +263,24 @@ void moveCells(int numCells) {
     pcnt_get_counter_value(pcntR, &rT);
 
     currentTicks = (abs(lT) + abs(rT)) / 2;
+
+    // Front-wall ranging (~30 Hz): stop early if we've reached the standoff from a
+    // wall ahead, so a tick-count overshoot never noses us into the front wall.
+    if (okFront && millis() - lastFront >= 30) {
+      dFront = readDistance(sensorFront, okFront);
+      lastFront = millis();
+      if (dFront != TOF_OPEN && dFront <= FRONT_STOP_MM) {
+        Serial.printf("[front-stop] wall at %d mm, halting early\n", dFront);
+        break;
+      }
+    }
+
+    // Live ToF telemetry while driving (throttled to ~10 Hz so it never stalls motion)
+    if (millis() - lastTele >= 100) {
+      readToF();
+      printToF("[drive]");
+      lastTele = millis();
+    }
 
     int baseSpeed;
     if (currentTicks < RAMP_TICKS)
@@ -276,6 +323,20 @@ void executeTurn(float targetRotations, int leftSpeed, int rightSpeed) {
   delay(200);
 }
 
+// Turn parameters (spin in place: both wheels drive opposite directions).
+// Per-wheel rotations for a 90 deg spin is ~half the old single-wheel pivot value.
+const float TURN_90_ROT  = 0.675; // was 1.35 rot on one wheel when pivoting
+const float TURN_180_ROT = 1.30;  // unchanged (already a spin)
+const int   TURN_SPEED   = 70;
+
+// Rotate in place by the shortest amount to face nextDir, given current robotDir.
+// diff: 1 = turn right 90, 2 = 180, 3 = turn left 90.
+void turnByDiff(int diff) {
+  if (diff == 1)      executeTurn(TURN_90_ROT,  TURN_SPEED, -TURN_SPEED); // spin right
+  else if (diff == 2) executeTurn(TURN_180_ROT, TURN_SPEED, -TURN_SPEED); // spin 180
+  else if (diff == 3) executeTurn(TURN_90_ROT, -TURN_SPEED,  TURN_SPEED); // spin left
+}
+
 void setupQuadrature(pcnt_unit_t unit, int pinA, int pinB) {
   pcnt_config_t config = {};
   config.pulse_gpio_num = pinA; config.ctrl_gpio_num = pinB;
@@ -288,44 +349,49 @@ void setupQuadrature(pcnt_unit_t unit, int pinA, int pinB) {
 }
 
 // ======================== TOF INIT ========================
+// Brings one sensor out of reset and initialises it, retrying a few times so a
+// slow-rising XSHUT line or a busy bus doesn't leave a good sensor offline.
+bool bootSensor(VL53L0X &s, int xshutPin, uint8_t addr, const char *name) {
+  digitalWrite(xshutPin, HIGH);
+  delay(50); // settle time (longer than before for reliable power-up)
+
+  for (int attempt = 1; attempt <= 3; attempt++) {
+    s.setTimeout(500);
+    if (s.init()) {
+      s.setAddress(addr);
+      s.startContinuous();
+      Serial.printf("[OK] %s ToF at 0x%02X (attempt %d)\n", name, addr, attempt);
+      return true;
+    }
+    Serial.printf("[..] %s ToF init failed, retry %d\n", name, attempt);
+    delay(30);
+  }
+  Serial.printf("[ERROR] %s ToF failed to initialize!\n", name);
+  return false;
+}
+
 void setupToF() {
-  Wire.begin(I2C_SDA, I2C_SCL);
-  Wire.setClock(400000); // 400kHz Fast I2C
+  Wire.begin(I2C_SDA, I2C_SCL); // default 100kHz (matches the verified 3-sensor sketch)
 
-  // Hold all sensors in reset, then bring each up one at a time to reassign addresses.
-  pinMode(XSHUT_F, OUTPUT); pinMode(XSHUT_L, OUTPUT); pinMode(XSHUT_R, OUTPUT);
-  digitalWrite(XSHUT_F, LOW); digitalWrite(XSHUT_L, LOW); digitalWrite(XSHUT_R, LOW);
-  delay(10);
+  // Hold all sensors in reset simultaneously, then bring each up one at a time.
+  pinMode(XSHUT_F, OUTPUT); digitalWrite(XSHUT_F, LOW);
+  pinMode(XSHUT_L, OUTPUT); digitalWrite(XSHUT_L, LOW);
+  pinMode(XSHUT_R, OUTPUT); digitalWrite(XSHUT_R, LOW);
+  delay(100); // full power-down settle (verified value)
 
-  // Boot Front
-  digitalWrite(XSHUT_F, HIGH); delay(10);
-  okFront = sensorFront.init();
-  if (okFront) { sensorFront.setAddress(ADDR_FRONT); sensorFront.setTimeout(500); }
-  else Serial.println("WARN: Front ToF init failed");
-
-  // Boot Left
-  digitalWrite(XSHUT_L, HIGH); delay(10);
-  okLeft = sensorLeft.init();
-  if (okLeft) { sensorLeft.setAddress(ADDR_LEFT); sensorLeft.setTimeout(500); }
-  else Serial.println("WARN: Left ToF init failed");
-
-  // Boot Right
-  digitalWrite(XSHUT_R, HIGH); delay(10);
-  okRight = sensorRight.init();
-  if (okRight) { sensorRight.setAddress(ADDR_RIGHT); sensorRight.setTimeout(500); }
-  else Serial.println("WARN: Right ToF init failed");
-
-  if (okFront) sensorFront.startContinuous(20);
-  if (okLeft)  sensorLeft.startContinuous(20);
-  if (okRight) sensorRight.startContinuous(20);
+  okFront = bootSensor(sensorFront, XSHUT_F, ADDR_FRONT, "Front");
+  okLeft  = bootSensor(sensorLeft,  XSHUT_L, ADDR_LEFT,  "Left");
+  okRight = bootSensor(sensorRight, XSHUT_R, ADDR_RIGHT, "Right");
 }
 
 // ======================== MAIN SETUP & LOOP ========================
 void setup() {
   Serial.begin(115200);
+  delay(2000); // let USB-serial settle and give GPIO0 time to release after boot
+
   pinMode(AIN1, OUTPUT); pinMode(AIN2, OUTPUT); pinMode(PWMA, OUTPUT);
   pinMode(BIN1, OUTPUT); pinMode(BIN2, OUTPUT); pinMode(PWMB, OUTPUT);
-  pinMode(STBY, OUTPUT); digitalWrite(STBY, HIGH);
+  // STBY tied to 3.3V in hardware; no GPIO setup needed.
 
   pinMode(BTN_BOOT, INPUT_PULLUP); // BOOT button as start switch
 
@@ -375,7 +441,7 @@ void loop() {
     int nextDir = getNextDirection();
     if (nextDir != robotDir) {
       int diff = (nextDir - robotDir + 4) % 4;
-      if (diff == 1) executeTurn(1.35, 70, 0); else if (diff == 2) executeTurn(1.30, 70, -70); else if (diff == 3) executeTurn(1.35, 0, 70);
+      turnByDiff(diff);
       robotDir = nextDir;
     }
     moveCells(1); // Stop-and-Go exploration
@@ -398,7 +464,7 @@ void loop() {
     int nextDir = getNextDirection();
     if (nextDir != robotDir) {
       int diff = (nextDir - robotDir + 4) % 4;
-      if (diff == 1) executeTurn(1.35, 70, 0); else if (diff == 2) executeTurn(1.30, 70, -70); else if (diff == 3) executeTurn(1.35, 0, 70);
+      turnByDiff(diff);
       robotDir = nextDir;
     }
     moveCells(1); // Stop-and-Go return
@@ -434,7 +500,7 @@ void loop() {
     int nextDir = getNextDirection();
     if (nextDir != robotDir) {
       int diff = (nextDir - robotDir + 4) % 4;
-      if (diff == 1) executeTurn(1.35, 70, 0); else if (diff == 2) executeTurn(1.30, 70, -70); else if (diff == 3) executeTurn(1.35, 0, 70);
+      turnByDiff(diff);
       robotDir = nextDir;
     }
 
